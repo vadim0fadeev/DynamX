@@ -11,17 +11,17 @@ import fr.dynamx.common.DynamXContext;
 import fr.dynamx.common.DynamXMain;
 import fr.dynamx.common.contentpack.ContentPackLoader;
 import fr.dynamx.common.contentpack.PackInfo;
-import fr.dynamx.common.contentpack.type.objects.AbstractProp;
-import fr.dynamx.common.contentpack.type.objects.PropObject;
 import fr.dynamx.common.objloader.data.DxModelData;
-import fr.dynamx.common.objloader.data.GltfModelData;
-import fr.dynamx.common.objloader.data.ObjModelData;
 import fr.dynamx.utils.DynamXConstants;
 import fr.dynamx.utils.DynamXUtils;
 import fr.dynamx.utils.optimization.Vector3fPool;
 import net.minecraft.util.ResourceLocation;
+import net.minecraftforge.common.config.Config;
+import net.minecraftforge.common.config.ConfigManager;
+import net.minecraftforge.fml.client.event.ConfigChangedEvent;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import vhacd.VHACD;
-import vhacd.VHACDHull;
 import vhacd.VHACDParameters;
 
 import java.io.*;
@@ -32,14 +32,43 @@ import java.util.zip.*;
 
 import static fr.dynamx.common.DynamXMain.log;
 
+@Config(modid = "dynamxmod", category = "vhacd")
+@Config.LangKey("dynamx.config.vhacd.title")
+@Mod.EventBusSubscriber(modid = "dynamxmod")
 public class ShapeUtils {
-    // Shape generation
+    private static final byte[] ZIP_BUFFER = new byte[8192];
+    private static final Set<String> SAFE_CLASSES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
+            ShapeGenerator.class.getName(), ArrayList.class.getName(), float[].class.getName(), float[].class.getCanonicalName()
+    )));
+
+    @Config.Comment("Параметр Convex Hull Downsampling для VHACD")
+    @Config.LangKey("dynamx.config.vhacd.convexHullDownSampling")
+    @Config.RangeInt(min = 1, max = 10)
+    public static int vhacdConvexHullDownSampling = 1;
+
+    @Config.Comment("Параметр Plane Downsampling для VHACD")
+    @Config.LangKey("dynamx.config.vhacd.planeDownSampling")
+    @Config.RangeInt(min = 1, max = 10)
+    public static int vhacdPlaneDownSampling = 1;
+
+    @Config.Comment("Параметр Max Vertices Per Hull для VHACD")
+    @Config.LangKey("dynamx.config.vhacd.maxVerticesPerHull")
+    @Config.RangeInt(min = 4, max = 1024)
+    public static int vhacdMaxVerticesPerHull = 1024;
+
+    @Config.Comment("Параметр Voxel Resolution для VHACD")
+    @Config.LangKey("dynamx.config.vhacd.voxelResolution")
+    @Config.RangeInt(min = 10000, max = 64000000)
+    public static int vhacdVoxelResolution = 10000;
+
+
     public static CompoundCollisionShape generateComplexModelCollisions(DxModelPath path, String objectName, Vector3f scale, Vector3f centerOfMass, float shapeYOffset) {
         String lowerCaseObjectName = objectName.toLowerCase();
-        String format = "." + path.getFormat().toString().toLowerCase();
-        ResourceLocation dcFileLocation = new ResourceLocation(path.getModelPath().toString().replace(format, "_" + lowerCaseObjectName + "_" + DynamXConstants.DC_FILE_VERSION + ".dc"));
+        String dcFileName = path.getModelPath().toString().replace("." + path.getFormat().toString().toLowerCase(), "_" + lowerCaseObjectName + "_" + DynamXConstants.DC_FILE_VERSION + ".dc");
+        ResourceLocation dcFileLocation = new ResourceLocation(dcFileName);
         InputStream dcInputStream = null;
         PackInfo dcFilePackInfo = null;
+
         for (PackInfo packInfo : path.getPackLocations()) {
             try {
                 dcInputStream = packInfo.readFile(dcFileLocation);
@@ -48,34 +77,26 @@ public class ShapeUtils {
                     break;
                 }
             } catch (IOException e) {
-                //TODO FIX
-                throw new RuntimeException(e);
+                log.error("Error reading dc file from pack " + packInfo, e);
+                throw new RuntimeException("Error accessing dc file: " + dcFileLocation + " in pack: " + packInfo, e);
             }
         }
 
         ShapeGenerator shapeGenerator = null;
-        long start = System.currentTimeMillis();
         if (dcInputStream != null) {
-            //load file
-            try {
-                shapeGenerator = loadFile(dcInputStream);
+            try (InputStream inputStream = dcInputStream) {
+                shapeGenerator = loadFile(inputStream);
             } catch (Exception e) {
                 log.error("Cannot load .dc file of " + path + ". Re-creating it. Errored dc file was found in " + dcFilePackInfo, e);
-                //do it just after file.delete();
-            } finally {
-                try {
-                    dcInputStream.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
             }
         }
+
         if (shapeGenerator == null) {
             DxModelData model = DynamXContext.getDxModelDataFromCache(path);
-            String modelPath = DynamXMain.resourcesDirectory + File.separator + path.getPackName() + File.separator + "assets" + //todo prevents from saving in zip files : we use the pack name
+            String modelPath = DynamXMain.resourcesDirectory + File.separator + path.getPackName() + File.separator + "assets" +
                     File.separator + path.getModelPath().getNamespace() + File.separator + path.getModelPath().getPath().replace("/", File.separator);
-            String modelName = modelPath.substring(modelPath.lastIndexOf(File.separator) + 1);
-            File file = new File(modelPath.replace(format, "_" + lowerCaseObjectName + "_" + DynamXConstants.DC_FILE_VERSION + ".dc"));
+            String dcFilePath = modelPath.replace("." + path.getFormat().toString().toLowerCase(), "_" + lowerCaseObjectName + "_" + DynamXConstants.DC_FILE_VERSION + ".dc");
+            File dcFile = new File(dcFilePath);
 
             float[] pos = lowerCaseObjectName.isEmpty() ? model.getVerticesPos() : model.getVerticesPos(lowerCaseObjectName);
             int[] indices = lowerCaseObjectName.isEmpty() ? model.getAllMeshIndices() : model.getMeshIndices(lowerCaseObjectName);
@@ -83,43 +104,36 @@ public class ShapeUtils {
                 throw new IllegalArgumentException("Part '" + objectName + "' of '" + path + "' does not exist or is empty. Check the name of the part in the obj file.");
             }
 
-            long end = System.currentTimeMillis();
-            long time = end - start;
-            log.info("Converted " + modelName + " model to shape and in " + time + " ms");
+            log.info("Converted model '{}' to shape.", path.getModelPath());
 
-            start = System.currentTimeMillis();
             VHACDParameters parameters = new VHACDParameters();
-
-            parameters.setConvexHullDownSampling(1);
-            parameters.setPlaneDownSampling(1);
-            parameters.setMaxVerticesPerHull(1024);
-            parameters.setVoxelResolution(10000);
-            //parameters.setDebugEnabled(true);
+            parameters.setConvexHullDownSampling(vhacdConvexHullDownSampling);
+            parameters.setPlaneDownSampling(vhacdPlaneDownSampling);
+            parameters.setMaxVerticesPerHull(vhacdMaxVerticesPerHull);
+            parameters.setVoxelResolution(vhacdVoxelResolution);
 
             shapeGenerator = new ShapeGenerator(pos, indices, parameters);
-            if (!file.getPath().contains(".zip") && !file.getPath().contains(ContentPackLoader.PACK_FILE_EXTENSION)) { //not a zip pack
-                file.getParentFile().mkdirs(); //todo pb if a pack is DartcherPack-Trucks.zip, and PackName: DartcherPack, the file will use DartcherPack
-                saveFile(file, shapeGenerator);
-            } else {
-                log.warn("Saving .dc file of " + modelPath + " of a zipped pack in " + file + ". Consider putting it in the zip file of the pack.");
-                try {
-                    boolean zipped = file.getPath().contains(".zip");
-                    File zipFile;
-                    if (zipped) {
-                        zipFile = new File(file.getPath().substring(0, file.getPath().lastIndexOf(".zip") + 4));
-                    } else {
-                        zipFile = new File(file.getPath().substring(0, file.getPath().lastIndexOf(ContentPackLoader.PACK_FILE_EXTENSION) + ContentPackLoader.PACK_FILE_EXTENSION.length()));
-                    }
-                    addFilesToExistingZip(zipFile, file, shapeGenerator);
 
-                    log.info("Saved the shape " + file.getName());
+            if (!dcFile.getPath().contains(".zip") && !dcFile.getPath().contains(ContentPackLoader.PACK_FILE_EXTENSION)) {
+                dcFile.getParentFile().mkdirs();
+                saveFile(dcFile, shapeGenerator);
+            } else {
+                log.warn("Saving .dc file of '{}' in zipped pack at '{}'. Consider including it in the pack.", path.getModelPath(), dcFile);
+                try {
+                    File zipFile;
+                    if (dcFile.getPath().contains(".zip")) {
+                        zipFile = new File(dcFile.getPath().substring(0, dcFile.getPath().lastIndexOf(".zip") + 4));
+                    } else {
+                        zipFile = new File(dcFile.getPath().substring(0, dcFile.getPath().lastIndexOf(ContentPackLoader.PACK_FILE_EXTENSION) + ContentPackLoader.PACK_FILE_EXTENSION.length()));
+                    }
+                    addFileToExistingZip(zipFile, dcFile, shapeGenerator);
+                    log.info("Saved shape '{}' to zip.", dcFile.getName());
                 } catch (IOException e) {
+                    log.error("Error adding .dc file to zip archive for '{}'", path.getModelPath(), e);
                     e.printStackTrace();
                 }
             }
-            end = System.currentTimeMillis();
-            time = end - start;
-            log.info("Generated " + file.getName() + " shape in " + time + " ms");
+            log.info("Generated shape for '{}'.", dcFile.getName());
         }
         CompoundCollisionShape collisionShape = new CompoundCollisionShape();
         for (float[] hullPoint : shapeGenerator.getHullPoints()) {
@@ -127,91 +141,83 @@ public class ShapeUtils {
                 throw new IllegalArgumentException("Empty .dc file for part '" + objectName + "' of '" + path + "'. Please delete it, check your obj model and restart the game.");
             }
             HullCollisionShape hullShape = new HullCollisionShape(hullPoint);
-            hullShape.setScale(scale.subtract(new Vector3f(.1f, .1f, .1f)));
+            hullShape.setScale(scale);
             collisionShape.addChildShape(hullShape, new Vector3f(centerOfMass.x, shapeYOffset + centerOfMass.y, centerOfMass.z));
         }
-        long time = System.currentTimeMillis() - start;
-        if (time > 10)
-            log.warn("Loaded " + dcFileLocation + " in " + time + " ms");
         return collisionShape;
     }
 
-    public static void addFilesToExistingZip(File zipFile, File modelFile, ShapeGenerator shapeGenerator) throws IOException {
-        byte[] buf = new byte[1024];
+    public static void addFileToExistingZip(File zipFile, File modelFile, ShapeGenerator shapeGenerator) throws IOException {
         File outputZipFile = new File(zipFile.getParentFile(), zipFile.getName() + ".temp");
-        ZipInputStream zin = new ZipInputStream(Files.newInputStream(zipFile.toPath()));
-        ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(outputZipFile.toPath()));
+        try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(zipFile.toPath()));
+             ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(outputZipFile.toPath()))) {
 
-        ZipEntry entry = zin.getNextEntry();
-        while (entry != null) {
-            String name = entry.getName();
-            boolean notInFiles = !modelFile.getName().equals(name);
-            if (notInFiles) {
-                // Add ZIP entry to output stream.
-                out.putNextEntry(new ZipEntry(name));
-                // Transfer bytes from the ZIP file to the output file
-                int len;
-                while ((len = zin.read(buf)) > 0) {
-                    out.write(buf, 0, len);
+            ZipEntry entry = zin.getNextEntry();
+            while (entry != null) {
+                String name = entry.getName();
+                if (!modelFile.getName().equals(name)) {
+                    out.putNextEntry(new ZipEntry(name));
+                    long transferred = 0;
+                    long entrySize = entry.getSize();
+                    while (true) {
+                        int len = zin.read(ZIP_BUFFER);
+                        if (len <= 0) break;
+                        out.write(ZIP_BUFFER, 0, len);
+                        transferred += len;
+                    }
                 }
+                entry = zin.getNextEntry();
             }
-            entry = zin.getNextEntry();
+
+            out.putNextEntry(new ZipEntry(modelFile.getName()));
+            try (ObjectOutputStream shapeBytes = new ObjectOutputStream(new GZIPOutputStream(out))) {
+                shapeBytes.writeObject(shapeGenerator);
+            }
+            out.closeEntry();
         }
-        // Close the streams
-        zin.close();
-        // Compress the files
 
-        // Add ZIP entry to output stream.
-        out.putNextEntry(new ZipEntry(modelFile.getName()));
-        // Transfer bytes from the file to the ZIP file
-        ObjectOutputStream shapeBytes = new ObjectOutputStream(new GZIPOutputStream(out));
-        shapeBytes.writeObject(shapeGenerator);
-
-        // Complete the entry
-        out.closeEntry();
-        // Complete the ZIP file
-        out.close();
-
-        System.out.println(zipFile.delete());
-        System.out.println("Deleted old");
-        System.out.println(outputZipFile.renameTo(zipFile));
+        if (!zipFile.delete()) {
+            log.warn("Failed to delete old zip file: '{}'", zipFile.getAbsolutePath());
+        }
+        if (!outputZipFile.renameTo(zipFile)) {
+            log.error("Failed to rename temp zip file '{}' to '{}'", outputZipFile.getAbsolutePath(), zipFile.getAbsolutePath());
+            throw new IOException("Failed to rename temp zip file: " + outputZipFile.getAbsolutePath() + " to " + zipFile.getAbsolutePath());
+        }
+        log.info("Updated zip file: '{}'", zipFile.getAbsolutePath());
     }
 
     private static void saveFile(File file, ShapeGenerator shapeGenerator) {
-        try {
-            ObjectOutputStream out = new ObjectOutputStream(new GZIPOutputStream(Files.newOutputStream(file.toPath())));
+        try (ObjectOutputStream out = new ObjectOutputStream(new GZIPOutputStream(Files.newOutputStream(file.toPath())))) {
             out.writeObject(shapeGenerator);
-            out.close();
-            log.info("Saved the shape " + file.getName());
+            log.info("Saved shape file: '{}'", file.getName());
         } catch (IOException e) {
+            log.error("Error saving shape file: '{}'", file.getName(), e);
             e.printStackTrace();
         }
     }
 
     private static ShapeGenerator loadFile(InputStream file) {
-        try {
-            Set<String> classesSet = Collections.unmodifiableSet(new HashSet(Arrays.asList(ShapeGenerator.class.getName(), ArrayList.class.getName(), float[].class.getName())));
-            ObjectInputStream in = new ObjectInputStream(new GZIPInputStream(file)) {
-                @Override
-                protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
-                    if (!classesSet.contains(desc.getName())) {
-                        throw new InvalidClassException("Unauthorized deserialization attempt", desc.getName());
-                    }
-                    return super.resolveClass(desc);
+        try (ObjectInputStream in = new ObjectInputStream(new GZIPInputStream(file)) {
+            @Override
+            protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+                if (!SAFE_CLASSES.contains(desc.getName()) && !SAFE_CLASSES.contains(desc.forClass().getCanonicalName())) {
+                    throw new InvalidClassException("Unauthorized deserialization attempt", desc.getName());
                 }
-            };
+                return super.resolveClass(desc);
+            }
+        }) {
             return (ShapeGenerator) in.readObject();
         } catch (IOException | ClassNotFoundException e) {
-            throw new RuntimeException("Cannot load " + file, e);
+            throw new RuntimeException("Cannot load shape file", e);
         }
     }
 
     public static FloatBuffer[] getDebugBuffer(CompoundCollisionShape compoundShape) {
+        int childrenCount = compoundShape.listChildren().length;
+        FloatBuffer[] debugBuffer = new FloatBuffer[childrenCount];
         int i = 0;
-        FloatBuffer[] debugBuffer = new FloatBuffer[compoundShape.listChildren().length];
         for (ChildCollisionShape ccs : compoundShape.listChildren()) {
-            debugBuffer[i] = getDebugBuffer(ccs.getShape());
-            i++;
+            debugBuffer[i++] = getDebugBuffer(ccs.getShape());
         }
         return debugBuffer;
     }
@@ -230,11 +236,10 @@ public class ShapeUtils {
         if (compoundShape != null) {
             int j = 0;
             for (ChildCollisionShape sh : compoundShape.listChildren()) {
-                FloatBuffer fb = debugBuffer[j];
+                FloatBuffer fb = debugBuffer[j++];
                 if (fb != null) {
                     vectors.addAll(DynamXUtils.floatBufferToVec3f(fb, sh.copyOffset(Vector3fPool.get())));
                 }
-                j++;
             }
         } else {
             for (FloatBuffer fb : debugBuffer) {
@@ -248,16 +253,22 @@ public class ShapeUtils {
     }
 
     public static class ShapeGenerator implements Serializable {
-
-        public List<float[]> points = new ArrayList<>();
+        private static final long serialVersionUID = 1L;
+        public final List<float[]> points = new ArrayList<>();
 
         public ShapeGenerator(float[] positions, int[] indices, VHACDParameters params) {
-            List<VHACDHull> hullList = VHACD.compute(positions, indices, params);
-            hullList.forEach(hull -> points.add(hull.clonePositions()));
+            VHACD.compute(positions, indices, params).forEach(hull -> points.add(hull.clonePositions()));
         }
 
         public List<float[]> getHullPoints() {
             return points;
+        }
+    }
+
+    @SubscribeEvent
+    public static void onConfigChanged(ConfigChangedEvent.OnConfigChangedEvent event) {
+        if (event.getModID().equals("dynamxmod")) {
+            ConfigManager.sync("dynamxmod", Config.Type.INSTANCE);
         }
     }
 }
