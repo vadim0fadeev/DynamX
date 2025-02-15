@@ -48,11 +48,6 @@ import org.joml.Matrix4f;
 
 import java.util.*;
 
-/**
- * All information about a vehicle
- *
- * @see BaseVehicleEntity
- */
 @Getter
 public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, ModularVehicleInfo> implements IPhysicsPackInfo, IModelTextureVariantsSupplier,
         ParticleEmitterInfo.IParticleEmitterContainer, IModelPackObject, IPartContainer<ModularVehicleInfo>, ICollisionsContainer, ILightOwner<ModularVehicleInfo> {
@@ -68,8 +63,6 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @Setter
     private VehicleValidator validator;
 
-    /* == Pack properties == */
-
     @PackFileProperty(configNames = "DefaultEngine", required = false)
     protected String defaultEngine;
     @PackFileProperty(configNames = "DefaultSounds", required = false)
@@ -78,10 +71,6 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @PackFileProperty(configNames = "MaxVehicleSpeed", required = false, defaultValue = "infinite")
     protected float vehicleMaxSpeed = Integer.MAX_VALUE;
 
-    /**
-     * The directing wheel id <br>
-     * Used to render the steering wheel
-     */
     private int directingWheel;
 
     @Getter
@@ -93,8 +82,6 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @Setter
     @PackFileProperty(configNames = "DefaultZoomLevel", required = false, defaultValue = "4")
     protected int defaultZoomLevel = 4;
-
-    /* == Physics properties == */
 
     @Getter
     @Setter
@@ -129,18 +116,10 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @PackFileProperty(configNames = "UseComplexCollisions", required = false, defaultValue = "true", description = "common.UseComplexCollisions")
     protected boolean useComplexCollisions = true;
 
-    /**
-     * The shapes of this vehicle, can be used for collisions
-     */
     @Getter
     protected ObjectCollisionsHelper collisionsHelper = new ObjectCollisionsHelper();
 
-    /**
-     * The friction points of this vehicle
-     */
     protected final List<FrictionPoint> frictionPoints = new ArrayList<>();
-
-    /* == Render properties == */
 
     @PackFileProperty(configNames = "ShapeYOffset", required = false)
     protected float shapeYOffset;
@@ -153,19 +132,10 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @PackFileProperty(configNames = "RenderDistanceSquared", required = false, defaultValue = "-1")
     protected float renderDistance = -1;
 
-    /**
-     * The particle emitters of this vehicle
-     */
     protected final List<ParticleEmitterInfo<?>> particleEmitters = new ArrayList<>();
 
-    /**
-     * The light sources of this vehicle
-     */
     protected final Map<String, PartLightSource> lightSources = new HashMap<>();
 
-    /**
-     * Maps the metadata to the texture data
-     */
     private MaterialVariantsInfo<ModularVehicleInfo> variants;
 
     protected SceneNode<?, ?> sceneGraph;
@@ -173,6 +143,11 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @Deprecated
     @PackFileProperty(configNames = "Textures", required = false, type = DefinitionType.DynamXDefinitionTypes.STRING_ARRAY_2D)
     private String[][] texturesArray;
+
+    @Getter
+    @Setter
+    @PackFileProperty(configNames = "ChassisObjectName", required = false, defaultValue = "chassis")
+    protected String chassisObjectName = "chassis";
 
 
     public ModularVehicleInfo(String packName, String fileName, VehicleValidator validator) {
@@ -184,9 +159,8 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
     @Override
     public boolean postLoad(boolean hot) {
         DxModelPath modelPath = DynamXUtils.getModelPath(getPackName(), model);
-        collisionsHelper.loadCollisions(this, modelPath, "chassis", centerOfMass, shapeYOffset, useComplexCollisions, scaleModifier, ObjectCollisionsHelper.CollisionType.VEHICLE);
+        collisionsHelper.loadCollisions(this, modelPath, getChassisObjectName(), centerOfMass, shapeYOffset, useComplexCollisions, scaleModifier, ObjectCollisionsHelper.CollisionType.VEHICLE);
 
-        //Attach wheels and verify handbrake (V. 2.13.5)
         Map<String, PartWheelInfo> wheels = DynamXObjectLoaders.WHEELS.getInfos();
         boolean hasHandbrake = false;
         int directingWheel = -1;
@@ -208,7 +182,6 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
                     partWheel.setHandBrakingWheel(true);
             }
         }
-        //Attach engine
         if (defaultEngine != null) {
             BaseEngineInfo engine = DynamXObjectLoaders.ENGINES.findOrLoadInfo(defaultEngine, validator.getEngineClass());
             if (engine == null)
@@ -216,19 +189,13 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
             engine.appendTo(this);
         }
         variants = getSubPropertyByType(MaterialVariantsInfo.class);
-        //Map textures
-        //Backward compatibility with 3.3.0
-        //Will be removed
         if (texturesArray != null) {
             variants = new MaterialVariantsInfo(this, texturesArray);
             variants.appendTo(this);
         }
-        //Map lights
         lightSources.values().forEach(PartLightSource::postLoad);
-        //Post-load sub-properties
         if (!super.postLoad(hot))
             return false;
-        //Validate vehicle type
         validator.validate(this);
         return true;
     }
@@ -358,11 +325,6 @@ public class ModularVehicleInfo extends AbstractItemObject<ModularVehicleInfo, M
         particleEmitters.add(particleEmitterInfo);
     }
 
-    /**
-     * Adds a light source to this vehicle
-     *
-     * @param source The light source to add
-     */
     @Override
     public void addLightSource(PartLightSource source) {
         if (lightSources.containsKey(source.getObjectName())) {
